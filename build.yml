@@ -1,0 +1,59 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Python 3.8 هو آخر إصدار يدعم Windows 7، ونسخة x86 تعمل على 32 و64 بت
+      - name: Setup Python 3.8 (x86)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.8"
+          architecture: x86
+
+      - name: Install PyInstaller
+        run: |
+          python -m pip install --upgrade "pip<25"
+          python -m pip install "pyinstaller==5.13.2"
+
+      - name: Build EXE
+        run: pyinstaller --noconfirm --clean --onefile --windowed --name SmartNotebook main.py
+
+      - name: Build installer (Inno Setup)
+        continue-on-error: true
+        run: |
+          choco install innosetup --version=6.2.2 -y --no-progress
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" installer.iss
+
+      - name: Upload EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: SmartNotebook-EXE
+          path: dist/SmartNotebook.exe
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: SmartNotebook-Setup
+          path: dist/SmartNotebook-Setup.exe
+          if-no-files-found: warn
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/SmartNotebook.exe
+            dist/SmartNotebook-Setup.exe
