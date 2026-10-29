@@ -19,6 +19,7 @@ import sqlite3
 from collections import Counter
 import sys
 import ssl
+import difflib
 import json
 import queue
 import threading
@@ -75,7 +76,7 @@ def stem(tok):
 _STOP_RAW = """
 في من على الى إلى عن مع هذا هذه ذلك تلك هو هي هم هن أن ان إن كان كانت يكون
 التي الذي الذين اللذين ما لا لم لن قد كل بعد قبل بين حتى أو او ثم إذا اذا لكن
-كما أي اي هنا هناك عند منذ خلال انا أنا نحن انت أنت كانوا يمكن ايضا أيضا فقط
+كما أي اي هنا هناك عند منذ خلال ماذا لماذا كيف متى اين أين هل كم انا أنا نحن انت أنت كانوا يمكن ايضا أيضا فقط
 the a an and or of to in on at for with by is are was were be been this that
 these those it its as from but not no if then so than into about over under
 """
@@ -226,29 +227,88 @@ class Engine:
         d = self.df.get(term, 0)
         return math.log(1 + (self.N - d + 0.5) / (d + 0.5))
 
+    def _bm25(self, c, length, terms):
+        s = 0.0
+        for t, w in terms.items():
+            f = c.get(t, 0)
+            if f:
+                s += w * self.idf(t) * (f * (self.K1 + 1)) / (
+                    f + self.K1 * (1 - self.B + self.B * length / self.avg))
+        return s
+
+    @staticmethod
+    def parse_query(q):
+        """#وسم للتصفية حسب الوسم، "عبارة" للمطابقة الحرفية، والباقي بحث ذكي."""
+        tags = [normalize(t) for t in re.findall(r"#(\S+)", q)]
+        phrases = [normalize(p) for p in re.findall(r'"([^"]+)"', q)]
+        rest = re.sub(r'"[^"]*"|#\S+', " ", q).strip()
+        return rest, tags, phrases
+
+    def match_terms(self, token):
+        """الجذور المطابقة: مطابقة تامة، أو بادئة، أو تقريبية (تصحيح الأخطاء الإملائية)."""
+        if token in self.df:
+            return {token}
+        out = set()
+        if len(token) >= 2:
+            out.update(v for v in self.df if v.startswith(token))
+        if not out and len(token) >= 4:
+            out.update(difflib.get_close_matches(token, list(self.df.keys()), n=3, cutoff=0.78))
+        return out
+
     def search(self, query):
         q = query.strip()
+        self.last_terms = set()
+        self.expanded_ids = set()
         if not q:
             return [(n, 0.0) for n in self.notes]
-        nq = normalize(q)
-        terms = set()
-        for t in tokenize(q):
-            if t in self.df:
-                terms.add(t)
-            elif len(t) >= 2:
-                terms.update(v for v in self.df if v.startswith(t))
-        out = []
-        for n, (c, length), hay in zip(self.notes, self.docs, self.hay):
-            score = 0.0
-            for t in terms:
-                f = c.get(t, 0)
-                if f:
-                    score += self.idf(t) * (f * (self.K1 + 1)) / (
-                        f + self.K1 * (1 - self.B + self.B * length / self.avg))
-            if nq in hay:
-                score += 1.5
-            if score > 0:
-                out.append((n, score))
+        rest, tags, phrases = self.parse_query(q)
+        idxs = []
+        for i, n in enumerate(self.notes):
+            ntags = normalize(n["tags"])
+            if all(t in ntags for t in tags) and all(p in self.hay[i] for p in phrases):
+                idxs.append(i)
+        nrest = normalize(rest).strip()
+        if not nrest:  # تصفية فقط (وسوم / عبارات)
+            return [(self.notes[i], 1.0) for i in idxs]
+
+        terms = {}
+        for t in tokenize(rest):
+            for m in self.match_terms(t):
+                terms[m] = max(terms.get(m, 0.0), 1.0 if m == t else 0.7)
+        self.last_terms = set(terms)
+
+        base = {}
+        for i in idxs:
+            c, length = self.docs[i]
+            sc = self._bm25(c, length, terms)
+            if nrest in self.hay[i]:
+                sc += 1.5
+            base[i] = sc
+        ranked = sorted((i for i in idxs if base[i] > 0), key=lambda i: -base[i])
+
+        # توسيع الاستعلام: مصطلحات مرتبطة مأخوذة من أفضل النتائج (بحث بالمعنى التقريبي)
+        exp = {}
+        if ranked and self.N >= 3:
+            agg = Counter()
+            limit = max(2, 0.6 * self.N)
+            for i in ranked[:3]:
+                c, _ = self.docs[i]
+                for t, f in c.items():
+                    if t in terms or self.df[t] < 2 or self.df[t] > limit:
+                        continue
+                    agg[t] += (1 + math.log(f)) * self.idf(t)
+            exp = {t: 0.35 for t, _ in agg.most_common(6)}
+
+        total = {}
+        for i in idxs:
+            c, length = self.docs[i]
+            sc = base[i]
+            if sc > 0:
+                total[i] = sc + (self._bm25(c, length, exp) if exp else 0.0)
+            elif exp and sum(1 for t in exp if t in c) >= 2:
+                total[i] = self._bm25(c, length, exp)
+                self.expanded_ids.add(self.notes[i]["id"])
+        out = [(self.notes[i], sc) for i, sc in total.items() if sc > 0]
         out.sort(key=lambda x: -x[1])
         return out
 
@@ -285,21 +345,21 @@ class Engine:
 
     def ask(self, query, top_notes=6, per_note=2):
         res = self.search(query)[:top_notes]
-        qt = set(tokenize(query))
+        qt = set(self.last_terms) or set(tokenize(query))
         items = []
         for n, sc in res:
+            expanded = n["id"] in self.expanded_ids
             ranked = []
-            for s in split_sentences(n["content"]):
-                ts = set(tokenize(s))
-                ov = sum(self.idf(t) for t in ts
-                         if t in qt or any(t.startswith(x) for x in qt))
-                if ov > 0:
-                    ranked.append((ov, s))
-            ranked.sort(key=lambda x: -x[0])
-            picks = [s for _, s in ranked[:per_note]]
+            if not expanded:
+                for sent in split_sentences(n["content"]):
+                    ov = sum(self.idf(t) for t in set(tokenize(sent)) if t in qt)
+                    if ov > 0:
+                        ranked.append((ov, sent))
+                ranked.sort(key=lambda x: -x[0])
+            picks = [sent for _, sent in ranked[:per_note]]
             if not picks:
                 picks = self.key_ideas(n["content"], 1)
-            items.append((n, sc, picks))
+            items.append((n, sc, picks, expanded))
         return items
 
 
@@ -481,6 +541,9 @@ class App:
         ttk.Label(top, text="بحث:").pack(side="right")
         self.search_entry.bind("<KeyRelease>", self.on_search_key)
         self.search_entry.bind("<Return>", lambda e: self.show_search_ideas())
+        ttk.Label(self.root, foreground="#666", anchor="e", padding=(12, 0, 12, 4),
+                  text='بحث ذكي: يتجاوز الأخطاء الإملائية ويجد الملاحظات ذات الصلة (≈)  •  #وسم للتصفية  •  "عبارة" للمطابقة الحرفية'
+                  ).pack(fill="x")
 
         pw = ttk.PanedWindow(self.root, orient="horizontal")
         pw.pack(fill="both", expand=True, padx=10, pady=(0, 4))
@@ -508,6 +571,7 @@ class App:
         self.text.pack(side="right", fill="both", expand=True)
         sb.config(command=self.text.yview)
         self.text.tag_configure("rtl", justify="right")
+        self.text.tag_configure("hit", background="#fff59d")
         self.text.bind("<KeyRelease>", lambda e: self.text.tag_add("rtl", "1.0", "end"))
 
         br = ttk.Frame(left)
@@ -740,11 +804,14 @@ class App:
     def refresh_list(self, select_id=None):
         q = self.search_var.get().strip()
         results = self.engine.search(q)
+        exp = self.engine.expanded_ids
         self._loading = True
         try:
             self.tree.delete(*self.tree.get_children())
             for n, _ in results:
-                self.tree.insert("", "end", iid=str(n["id"]), values=(n["title"] or "بدون عنوان",))
+                mark = "≈ " if n["id"] in exp else ""
+                self.tree.insert("", "end", iid=str(n["id"]),
+                                 values=(mark + (n["title"] or "بدون عنوان"),))
             sid = select_id if select_id is not None else self.current_id
             if sid is not None and self.tree.exists(str(sid)):
                 self.tree.selection_set(str(sid))
@@ -752,9 +819,29 @@ class App:
         finally:
             self._loading = False
         if q:
-            self.status_var.set("النتائج: %d من %d ملاحظة" % (len(results), self.engine.N))
+            extra = ""
+            if exp:
+                extra = "  (منها %d ≈ ذات صلة بالمعنى)" % len(exp)
+            self.status_var.set("النتائج: %d من %d ملاحظة%s" % (len(results), self.engine.N, extra))
+            if len(q) >= 2:
+                self.render_search_ideas(q)
         else:
             self.status_var.set("إجمالي الملاحظات: %d" % self.engine.N)
+        self.highlight()
+
+    def highlight(self):
+        """يلوّن كلمات البحث (بما فيها المصححة إملائياً) داخل الملاحظة المفتوحة."""
+        self.text.tag_remove("hit", "1.0", "end")
+        if not self.search_var.get().strip():
+            return
+        terms = self.engine.last_terms
+        if not terms:
+            return
+        content = self.text.get("1.0", "end-1c")
+        for m in TOKEN_RE.finditer(content):
+            n = normalize(m.group())
+            if len(n) >= 2 and stem(n) in terms:
+                self.text.tag_add("hit", "1.0+%dc" % m.start(), "1.0+%dc" % m.end())
 
     # ------------------------------------------------------------ المحرر
     def state(self):
@@ -788,7 +875,9 @@ class App:
         self.text.insert("1.0", n["content"])
         self.text.tag_add("rtl", "1.0", "end")
         self.snapshot = self.state()
-        self.write_ideas([])
+        if not self.search_var.get().strip():
+            self.write_ideas([])
+        self.highlight()
 
     def on_select(self, event=None):
         if self._loading:
@@ -895,20 +984,23 @@ class App:
         if not q:
             self.write_ideas([("n", "اكتب كلمة أو سؤالاً في خانة البحث.")])
             return
+        self.refresh_list()
+
+    def render_search_ideas(self, q):
         items = self.engine.ask(q)
         if not items:
-            self.write_ideas([("n", "لا توجد نتائج مطابقة.")])
+            self.write_ideas([("n", "لا توجد نتائج مطابقة. جرّب كلمات أخرى أو أقل.")])
             return
         blocks = []
-        for n, sc, picks in items:
-            blocks.append(("h", n["title"] or "بدون عنوان"))
-            blocks += [("b", s) for s in picks]
-        joined = " ".join(n["title"] + " " + n["content"] for n, _, _ in items)
+        for n, sc, picks, expanded in items:
+            title = n["title"] or "بدون عنوان"
+            blocks.append(("h", ("≈ %s  (ذات صلة)" % title) if expanded else title))
+            blocks += [("b", sent) for sent in picks]
+        joined = " ".join(n["title"] + " " + n["content"] for n, _, _, _ in items)
         kws = self.engine.keywords(joined, 8)
         if kws:
             blocks += [("h", "كلمات مرتبطة"), ("k", "  ،  ".join(kws))]
         self.write_ideas(blocks)
-        self.refresh_list()
 
     # ------------------------------------------------------------ أدوات
     def export_all(self):
