@@ -8,6 +8,7 @@ OutputBaseFilename=SmartNotebook-Setup
 Compression=lzma
 SolidCompression=yes
 MinVersion=6.1
+PrivilegesRequired=lowest
 UninstallDisplayIcon={app}\SmartNotebook.exe
 
 [Files]
